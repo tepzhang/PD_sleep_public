@@ -1,0 +1,1277 @@
+---
+title: "Sleep predicts morning pathophysiological features in PD"
+author: "Jinxiao Zhang"
+date: "2025-11-06"
+output: html_document
+---
+# Load packages
+```{r load packages}
+# Install any that are not already installed
+packages = c("tidyverse", "lme4", "lmerTest", "broom.mixed", "janitor", "scales", "RColorBrewer")
+install_if_missing <- function(pkg_list) {
+  new_pkgs <- pkg_list[!(pkg_list %in% installed.packages()[, "Package"])]
+  if (length(new_pkgs)) {
+    install.packages(new_pkgs, dependencies = TRUE)
+  } else {
+    message("All packages are already installed.")
+  }
+}
+install_if_missing(packages)
+
+# Load packages
+library(tidyverse)
+library(lmerTest)
+# library(lme4)
+library(broom.mixed)
+library(janitor)
+library(scales) # label_scientific
+library(RColorBrewer) # brewer.pal, get palette color hex values
+```
+
+# Read processed data
+```{r read processed data}
+# # patient labels
+# RCS02 = patient1
+# RCS03 = patient2
+# RCS07 = patient3
+# RCS09 = patient4
+# RCS16 = dysnonia patient (not included)
+
+# survey data
+df_dreem_reports = read_csv("data/dreem_reports.csv") %>% 
+  mutate(date = as.character(record_stop_date_recreated),
+         nrem_duration = n2_duration+n3_duration,
+         nrem_latency_aasm = pmin(n2_latency_aasm, n3_latency_aasm),
+         nrem_percentage_recalculated = n2_percentage+n3_percentage)
+
+df_survey_dreem_combined = read_csv("data/survey_dreem_combined_outcome_variables.csv") %>%
+              mutate(date = as.character(survey_date_recreated)) %>%
+              rename(sleepiness=sleepiness_1_to_9,
+                     restedness = rested_level_recode)
+
+# sleep DREEM hypnogram data
+df_dreem_hypnogram = read_csv('data/dreem_hypnogram.csv')
+
+
+# overnight sleep RC+S psd data
+df_overnight_psd = read_csv("data/overnight_psd.csv") %>% 
+  rowwise() %>% 
+  mutate(low_delta_power = sum(c_across(`_0.5`:`_2.0`)),
+         delta_power = sum(c_across(`_0.5`:`_4.0`)),
+         high_delta_power = sum(c_across(`_2.5`:`_4.0`)),
+         theta_power = sum(c_across(`_4.5`:`_8.0`)),
+         alpha_power = sum(c_across(`_8.5`:`_13.0`)),
+         beta_power = sum(c_across(`_13.5`:`_30.0`)),
+         gamma_power = sum(c_across(`_30.5`:`_60.0`)),
+         total_power = sum(c_across(`_0.5`:`_100.0`))) %>% 
+  # DBS freq: RCS02, RCS07, RCS16: 130.2 Hz; RCS03, 178.6 Hz; RCS09 150.6 Hz
+  mutate(entrained_gamma = ifelse(subject=="RCS03", sum(c_across(`_87.0`:`_91.5`)),
+                                  ifelse(subject=="RCS09", sum(c_across(`_73.0`:`_77.5`)),
+                                         sum(c_across(`_62.5`:`_67.0`))))) %>% 
+  mutate(date = strftime(strptime(date, format = "%m-%d-%y"), format = "%Y-%m-%d")) %>% 
+  select(subject, hemisphere, date, sleep_stage, channel, n_epoch,
+         low_delta_power, beta_power, delta_power, high_delta_power, theta_power, alpha_power,
+         gamma_power, entrained_gamma, 
+         total_power, everything()) %>% 
+  arrange(subject, date, hemisphere, sleep_stage, channel)
+
+# sleep psd data by hour
+df_overnight_delta_power_by_hour_stage = read_csv("data/overnight_psd_by_hour_by_stage_all_subjects_1-4Hz.csv") %>% 
+  filter(stage %in% c("REM", "N3", "N2")) %>% 
+  mutate(stage = ifelse(stage %in% c("N2", "N3"), "NREM", stage),
+         hour_num = hour_num + 1) %>% 
+  group_by(SessionIdentity, hour_num, stage) %>% 
+  # weighted mean of N2 and N3 into NREM
+  summarise(BG_psd = weighted.mean(BG_psd, n_epoch),
+            key2_psd = weighted.mean(key2_psd, n_epoch),
+            key3_psd = weighted.mean(key3_psd, n_epoch),
+            n_epoch = sum(n_epoch),
+            .groups = "keep") %>% 
+  mutate(cortical_psd = (key2_psd+key3_psd)/2) %>% 
+  filter(n_epoch >250)
+
+# overnight delta wave data
+df_delta_wave_metrics = read_csv('data/overnight_delta_negative_wave_metrics_summary_sawtooth.csv') %>%
+  mutate(wave_type="negative") %>% 
+  bind_rows(read_csv('data/overnight_delta_positive_wave_metrics_summary_sawtooth.csv') %>%
+              mutate(wave_type="positive")) %>%
+  mutate(date = as.character(date))
+
+# overnight beta bursts data
+df_beta_bursts_metrics = read_csv('data/overnight_beta_burst_metrics_all.csv') %>% 
+  rename(subject = subj) %>% 
+  mutate(date = str_replace_all(date, '_', "-"))
+
+# overnight recording duration
+df_rcs_overnight_duration = read_csv("data/RCS_overnight_recording_duration.csv") %>% 
+  rename(subject = subj) %>% 
+  mutate(duration_min = duration/60,
+         date = str_replace_all(date, '_', "-")) %>% 
+  select(subject, date, stage, duration_min)
+
+
+# morning resting psd data
+df_resting_psd_session_level = read_csv("data/resting_psd_session_level.csv")
+
+df_resting_psd_mean = read_csv("data/resting_psd_proc.csv") %>% 
+  mutate(channel = ifelse(channel == "BG", "BG", "cortical")) %>%
+  mutate(date = strftime(strptime(date, format = "%m-%d-%Y"), format = "%Y-%m-%d")) %>%
+  group_by(subject, date, hemisphere, channel) %>% 
+  summarise(resting_beta_power = log(mean(beta_power)),
+            resting_theta_power = log(mean(theta_power)),
+            resting_delta_power = log(mean(delta_power)),
+            resting_alpha_power = log(mean(alpha_power)),
+            resting_beta_power_rel = mean(beta_power_rel),
+            n_sec = n()) %>% 
+  mutate(n_sec = ifelse(channel == "BG", n_sec, n_sec/2)) %>%
+  ungroup()
+
+# morning resting connectivity data
+df_resting_connectivity = read_csv("data/resting_connectivity.csv") %>% 
+  mutate(date = strftime(strptime(date, format = "%m-%d-%y"), format = "%Y-%m-%d"),
+         pair_type = ifelse(pair == "key2-key3", "cortical-cortical", "BG-cortical")) %>% 
+  group_by(subject, date, hemisphere, pair_type, con_type) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  arrange(con_type, subject, date, hemisphere, pair_type) %>% 
+  ungroup() %>% 
+  rename(beta_connectivity = beta3_con)
+
+df_resting_connectivity_by_freq = read_csv("data/resting_connectivity_by_freq.csv") %>% 
+  mutate(date = strftime(strptime(date, format = "%m-%d-%y"), format = "%Y-%m-%d"),
+         pair_type = ifelse(pair == "key2-key3", "cortical-cortical", "BG-cortical")) %>% 
+  group_by(subject, date, hemisphere, pair_type, con_type) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  arrange(con_type, subject, date, hemisphere, pair_type) 
+
+# Evoked Potential data
+df_ep_amp = read_csv("data/EP_pkp_amplitude_all_cortical.csv") %>%
+  mutate(window = case_when(tmin==0.00~'early',
+                            tmin==0.01~'main'),
+         amplitude = log(amplitude)
+         ) %>%
+  select(-tmin, -tmax) %>%
+  pivot_wider(names_from = window, names_prefix = 'EP_amp_', values_from = amplitude)
+
+df_ep_psd = read_csv("data/EP_psd_all_cortical.csv") %>%
+  rowwise() %>%
+  mutate(total_power = sum(c_across(`0.0`:`100.0`)),
+         beta_power = sum(c_across(`15.0`:`30.0`)), # frequency resolution: 5 Hz
+         EP_beta_power_rel = beta_power/total_power) %>%
+  mutate(EP_beta_power = log(beta_power))
+
+df_ep_trial = df_ep_amp %>%
+  left_join(df_ep_psd %>% select(subject, hemisphere, channel, date, EP_beta_power, EP_beta_power_rel),
+            by = c("subject", "hemisphere", "channel", "date")) %>%
+  mutate(date = strftime(strptime(date, format = "%m-%d-%y"), format = "%Y-%m-%d"))
+```
+# Resting-state data
+```{r resting-state neural data}
+# combine resting data with dreem reports
+df_resting_sleep_combined = df_resting_psd_mean %>%
+  filter(channel != "BG") %>% 
+  left_join(df_resting_connectivity %>% 
+              filter(con_type == "coh",
+                     pair_type == "BG-cortical"), 
+            by = c("subject", "date", "hemisphere")) %>% 
+  left_join(df_dreem_reports %>%
+              filter(tst > 0) %>% 
+              select(subject, date,
+                     n1_duration, n2_duration, n3_duration, nrem_duration, rem_duration,
+                     n2_latency_aasm, n3_latency_aasm, nrem_latency_aasm, rem_latency_aasm, 
+                     sleep_efficiency, tst, waso, awakenings),
+            by = c("subject", "date")) %>% 
+  left_join(df_survey_dreem_combined %>%
+              filter(tst_hrs > 0),
+            by = c("subject", "date")) %>%
+  mutate(NREM_duration=nrem_duration/60, 
+         REM_duration=rem_duration/60,
+         NREM_latency=n3_latency_aasm/60,
+         REM_latency=rem_latency_aasm/60) %>% 
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+# show number of nights for each participant/hemisphere
+df_resting_sleep_combined %>% 
+  filter(!is.na(tst)) %>%
+  group_by(subject, hemisphere) %>% 
+  count()
+```
+
+
+```{r sleep metric models on resting-state data}
+outcome_variables = c("resting_beta_power")
+lmer_results_resting = data_frame()
+for (var in outcome_variables){
+  df = df_resting_sleep_combined %>%
+    rename(outcome_var = var) %>%
+    filter(disease == "PD")
+  message("\n\n outcome variable:", var, "\n")
+  
+  lmer_duration = lmer(outcome_var ~ NREM_duration + REM_duration + (1|subject/hemisphere), 
+                             REML = FALSE,
+                             data = df)
+  lmer_duration %>% summary() %>% print()
+  df_result_dur = lmer_duration %>%
+    tidy() %>%
+    filter(effect == "fixed",
+           term != "(Intercept)") %>% 
+    mutate(model = var)
+  
+  lmer_latency = lmer(outcome_var ~ NREM_latency + REM_latency + (1|subject/hemisphere), 
+                            REML = FALSE,
+                            data = df)
+  lmer_latency %>% summary() %>% print()
+  df_result_lat = lmer_latency %>%
+    tidy() %>%
+    filter(effect == "fixed",
+           term != "(Intercept)") %>% 
+    mutate(model = var)
+  
+  lmer_results_resting = lmer_results_resting %>% bind_rows(df_result_dur, df_result_lat)
+  
+  # scatter plot
+  lmer_combined = lmer_duration %>%
+    augment() %>%
+    pivot_longer(cols = c("NREM_duration", "REM_duration"),
+                 names_to = "predictor", values_to = "duration") %>%
+    bind_rows(lmer_latency %>%
+                augment() %>%
+                pivot_longer(cols = c("NREM_latency", "REM_latency"),
+                             names_to = "predictor", values_to = "duration"))
+
+  lmer_combined %>%
+    filter(predictor %in% c("REM_duration", "REM_latency")) %>%
+    mutate(predictor = case_when(predictor=="REM_duration"~ "REM_dur",
+                                 predictor=="REM_latency"~ "REM_lat",)) %>%
+    ggplot(aes(duration, outcome_var,
+               color = subject, shape = hemisphere,
+               grouping = interaction(subject, hemisphere)))+
+    geom_point(alpha = 0.5) +
+    geom_smooth(aes(y = .fitted, linetype = hemisphere),
+                color = "grey",
+                method = 'lm', se = FALSE, size = 0.3) +
+    geom_smooth(aes(y = .fixed + .resid, group = NA),
+                color = "black", method = 'lm', se = TRUE, linewidth = 1)+
+    labs(y = var, x= "hours")+
+    scale_y_continuous(breaks=seq(-11,-7,1))+
+    facet_wrap(~predictor,
+               scales = "free")+
+    theme_classic()
+  # ggsave(str_c("figures/lmer_", var, "_with_REM_duration_latency.png"), width = 3.6, height = 1.6)
+}
+
+
+# plot LME coefficients
+lmer_results = lmer_results_resting
+colors = brewer.pal(n = 8, name = "Accent")
+lmer_results %>% 
+  mutate(outcome = factor(model, levels=outcome_variables)) %>% 
+  mutate(
+    # Create significance levels
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**", 
+      p.value < 0.05 ~ "*",
+      p.value < 0.1 ~ "'",
+      TRUE ~ "")) %>% 
+  separate(term, into = c("stage", "predictor"), sep = "_") %>% 
+  ggplot(aes(estimate, stage, color=predictor))+
+  # geom_hline(yintercept = 0, linetype="dashed", color="grey") +
+  geom_vline(xintercept = 0, linetype="dashed", color="grey") +
+  geom_pointrange(aes(xmin=estimate-qnorm(0.975)*std.error, 
+                      xmax =estimate+qnorm(0.975)*std.error),
+                  size=0.6, stroke = 1, shape=21, fill="white",
+                  position = position_dodge(0.5))+
+  geom_text(aes(estimate, stage, label = significance, group=predictor), 
+            color = "black",
+            position = position_dodge(0.5),
+          size = 6, vjust = 0.1) +
+  scale_color_manual(values = c(colors[3], colors[5]))+ # for duration predictors
+  labs(x='LME coefficient', y='stage')+
+  facet_wrap(~outcome, 
+             scales = "free",
+             ncol=1)+ 
+  theme_classic()+
+  theme(legend.position = "right")
+
+# ggsave("figures/lmer_coef_resting_metrics_with_sleep_duration_combined.png", width = 3.5, height = 1.5)
+```
+
+# Evoked potential (EP) data
+```{r Evoked potential data}
+# left join the ep and dreem sleep report data
+df_ep_sleep_combined = df_ep_trial %>%
+  left_join(df_dreem_reports %>%
+              filter(tst > 0) %>% 
+              select(subject, date,
+                     n1_duration, n2_duration, n3_duration, nrem_duration, rem_duration,
+                     n2_latency_aasm, n3_latency_aasm, nrem_latency_aasm, rem_latency_aasm, rem_percentage, nrem_percentage_recalculated,
+                     sleep_efficiency, tst, waso, awakenings)  ,
+            by = c("subject", "date")) %>% 
+  mutate(NREM_duration=nrem_duration/60, 
+         REM_duration=rem_duration/60,
+         NREM_latency=n3_latency_aasm/60, 
+         REM_latency=rem_latency_aasm/60) %>% 
+  # add disease condition
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+df_ep_sleep_combined %>% 
+  filter(!is.na(tst)) %>% 
+  group_by(subject, hemisphere) %>% 
+  count()
+```
+
+```{r sleep metric model on EP outcomes}
+outcome_variables = c("EP_amp_early", "EP_amp_main", "EP_beta_power")
+lmer_results_dur = data_frame()
+lmer_results_latency = data_frame()
+for (var in outcome_variables){
+  message(str_c("\n\n outcome variables:", var, "\n"))
+  df = df_ep_sleep_combined %>%
+    rename(outcome_var = var)
+
+  lmer_EP_duration = lmer(outcome_var ~ NREM_duration + REM_duration + (1|subject/hemisphere), 
+                          REML = FALSE,
+                          data = df %>% 
+                            filter(disease == "PD"))
+  lmer_EP_duration %>% 
+    summary(corr = FALSE) %>% 
+    print()
+  
+  df_result = lmer_EP_duration %>%
+    tidy() %>%
+    filter(effect == "fixed",
+           term != "(Intercept)") %>% 
+    mutate(model = var)
+  lmer_results_dur = lmer_results_dur %>% bind_rows(df_result)
+  
+  
+  lmer_EP_latency = lmer(outcome_var ~ REM_latency + NREM_latency + (1|subject/hemisphere), 
+                         REML = FALSE,
+                         data = df %>%
+                           filter(disease == "PD"))
+  lmer_EP_latency %>% 
+    summary(corr = FALSE) %>% 
+    print()
+  
+  df_result = lmer_EP_latency %>%
+    tidy() %>%  
+    filter(effect == "fixed",
+           term != "(Intercept)") %>% 
+    mutate(model = var)
+  lmer_results_latency = lmer_results_latency %>% bind_rows(df_result)
+  
+  # scatter plots
+  lmer_combined = lmer_EP_duration %>%
+    augment() %>%
+    pivot_longer(cols = c("NREM_duration", "REM_duration"), 
+                 names_to = "predictor", values_to = "duration") %>%
+    bind_rows(lmer_EP_latency %>%
+                augment() %>%
+                pivot_longer(cols = c("NREM_latency", "REM_latency"), 
+                             names_to = "predictor", values_to = "duration"))
+  
+  lmer_combined %>% 
+    filter(predictor %in% c("REM_duration", "REM_latency")) %>% 
+    mutate(predictor = case_when(predictor=="REM_duration"~ "REM_dur",
+                                 predictor=="REM_latency"~ "REM_lat",)) %>% 
+    ggplot(aes(duration, outcome_var,
+               color = subject, shape = hemisphere,
+               grouping = interaction(subject, hemisphere)))+
+    geom_point(alpha = 0.5) +
+    geom_smooth(aes(y = .fitted, linetype = hemisphere),
+                color = "grey",
+                method = 'lm', se = FALSE, size = 0.3) +
+    geom_smooth(aes(y = .fixed + .resid, group = NA),
+                color = "black", method = 'lm', se = TRUE, linewidth = 1)+
+    labs(y = var, x = 'hours')+
+    facet_wrap(~predictor,
+               scales = "free")+
+    theme_classic()
+  # ggsave(str_c("figures/lmer_", var, "_with_REM_duration_latency.png"), width = 3.6, height = 1.6)
+}
+
+
+# plot LME coefficients
+lmer_results = lmer_results_dur %>% 
+  bind_rows(lmer_results_latency)
+colors = brewer.pal(n = 8, name = "Accent")
+lmer_results %>% 
+  mutate(outcome = factor(model, levels=outcome_variables)) %>% 
+  mutate(
+    # Create significance levels
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**", 
+      p.value < 0.05 ~ "*",
+      p.value < 0.1 ~ "'",
+      TRUE ~ "")) %>% 
+  separate(term, into = c("stage", "predictor"), sep = "_") %>% 
+  ggplot(aes(estimate, stage, color=predictor))+
+  # geom_hline(yintercept = 0, linetype="dashed", color="grey") +
+  geom_vline(xintercept = 0, linetype="dashed", color="grey") +
+  geom_pointrange(aes(xmin=estimate-qnorm(0.975)*std.error, 
+                      xmax =estimate+qnorm(0.975)*std.error),
+                  size=0.6, stroke = 1, shape=21, fill="white",
+                  position = position_dodge(0.5))+
+  geom_text(aes(estimate, stage, label = significance, group=predictor), 
+            color = "black",
+            position = position_dodge(0.5),
+          size = 6, vjust = 0.1) +
+  scale_color_manual(values = c(colors[3], colors[5]))+ # for duration predictors
+  labs(x='LME coefficient', y='stage')+
+  facet_wrap(~outcome, 
+             scales = "free",
+             ncol=1)+ 
+  theme_classic()+
+  theme(legend.position = "right")
+
+# ggsave("figures/lmer_coef_EP_metrics_with_sleep_metrics_combined.png", width = 3.5, height = 4)
+```
+```{r combine overnight psd and morning dataframes}
+# process overnight psd data
+df_overnight_psd_proc = df_overnight_psd %>% 
+  select(subject:total_power) %>% 
+  # select certain channel and sleep stages
+  filter(sleep_stage %in% c("N2", "N3", "REM")) %>% 
+  mutate(sleep_stage = ifelse(sleep_stage %in% c("N2", "N3"), "NREM", "REM"),
+         channel = ifelse(channel == "BG", "BG", "cortical")) %>% 
+  group_by(subject, date, sleep_stage, hemisphere, channel) %>% 
+  # weighted mean of N2 and N3 into NREM
+  summarise(low_delta_power = weighted.mean(low_delta_power, n_epoch),
+            delta_power = weighted.mean(delta_power, n_epoch),
+            theta_power = weighted.mean(theta_power, n_epoch),
+            alpha_power = weighted.mean(alpha_power, n_epoch),
+            beta_power = weighted.mean(beta_power, n_epoch),
+            gamma_power = weighted.mean(gamma_power, n_epoch),
+            entrained_gamma = weighted.mean(entrained_gamma, n_epoch),
+            total_power = weighted.mean(total_power, n_epoch),
+            .groups = "keep") %>% 
+  mutate(beta_power_rel = beta_power/total_power,
+         delta_power_rel = delta_power/total_power,
+         low_delta_power = log(low_delta_power),
+         delta_power = log(delta_power),
+         theta_power = log(theta_power),
+         alpha_power = log(alpha_power),
+         beta_power = log(beta_power),
+         gamma_power = log(gamma_power),
+         entrained_gamma = log(entrained_gamma),
+         )
+
+# combine dataframes
+df_overnight_morning_combined = df_overnight_psd_proc %>% 
+  filter(channel == "cortical") %>%
+  left_join(df_survey_dreem_combined %>%
+              filter(tst_hrs > 0),
+            by = c("subject", "date")) %>%
+  left_join(df_ep_trial %>%
+               select(subject, hemisphere, date, channel, EP_amp_early, EP_amp_main, EP_beta_power),
+             by = c("subject", "date", "hemisphere", "channel")) %>%
+  left_join(df_resting_psd_mean %>% select(-n_sec),
+            by = c("subject", "date", "hemisphere", "channel")) %>%
+  left_join(df_resting_connectivity %>%
+              filter(pair_type == "BG-cortical",
+                     con_type == "coh"),
+            by = c("subject", "date", "hemisphere")) %>%
+  arrange(subject, date, sleep_stage, hemisphere, channel) %>%
+  # by subject z-scoring
+  group_by(subject, sleep_stage, hemisphere, channel) %>%
+  mutate_at(c("beta_power", "delta_power", "theta_power", "alpha_power",
+              "low_delta_power", "gamma_power", "entrained_gamma"), .funs = "scale") %>%
+  ungroup() %>%
+  # add disease condition
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+```
+
+```{r spectral power models on resting-state and EP outcomes}
+outcome_variables = c("resting_beta_power", "EP_amp_early", "EP_amp_main", "EP_beta_power")
+
+df_overnight_morning_combined_lmer = df_overnight_morning_combined %>% 
+  pivot_wider(names_from = sleep_stage, values_from = c("delta_power", "theta_power", "alpha_power", "beta_power", 
+                                                        "low_delta_power", "gamma_power", "entrained_gamma"),
+              id_cols = c("subject", "hemisphere", "date", "channel", "disease", "subc_site",
+                          all_of(outcome_variables))) %>%
+    rename(NREM_beta = beta_power_NREM,
+           REM_beta = beta_power_REM,
+           NREM_delta = delta_power_NREM,
+           REM_delta = delta_power_REM,)
+
+
+lmer_results_power = data_frame()
+for (var in outcome_variables){
+  message(str_c("\n\n outcome variables:", var, "\n"))
+  df = df_overnight_morning_combined_lmer %>%
+    rename(outcome_var = var) %>% 
+    filter(disease == "PD")
+  
+  # print(df)
+  lmer = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta + (1|subject/hemisphere),
+              REML = FALSE,
+              data = df)
+  lmer %>%
+    summary(corr = FALSE) %>%
+    print()
+  
+  df_result = lmer %>%
+    tidy() %>%
+    filter(effect == "fixed",
+           term != "(Intercept)") %>% 
+    mutate(model = var)
+  
+  lmer_results_power = lmer_results_power %>% bind_rows(df_result)
+}
+
+# plot LME coefficients
+lmer_results = lmer_results_power
+lmer_results %>% 
+  mutate(outcome = factor(model, levels=outcome_variables)) %>% 
+  mutate(
+    # Create significance levels
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**", 
+      p.value < 0.05 ~ "*",
+      p.value < 0.1 ~ "'",
+      TRUE ~ "")) %>% 
+  # filter(predictor %in% c("beta", "delta")) %>%
+  separate(term, into = c("stage", "predictor"), sep = "_") %>% 
+  ggplot(aes(estimate, stage, color=predictor))+
+  # geom_hline(yintercept = 0, linetype="dashed", color="grey") +
+  geom_vline(xintercept = 0, linetype="dashed", color="grey") +
+  geom_pointrange(aes(xmin=estimate-qnorm(0.975)*std.error, 
+                      xmax =estimate+qnorm(0.975)*std.error),
+                  size=0.6, stroke = 1, shape=21, fill="white",
+                  position = position_dodge(0.5))+
+  geom_text(aes(estimate, stage, label = significance, group=predictor), 
+            color = "black",
+            position = position_dodge(0.5),
+          size = 6, vjust = 0.1) +
+  scale_color_brewer(palette = "Accent")+ # for power predictors
+  labs(x='LME coefficient', y='stage')+
+  facet_wrap(~outcome, 
+             scales = "free",
+             ncol=1)+ 
+  theme_classic()+
+  theme(legend.position = "right")
+
+# ggsave("figures/lmer_coef_morning_outcomes_with_sleep_power_combined.png", width = 3.5, height = 6)
+```
+
+# Delta waves and beta bursts during sleep
+```{r delta waves density and amplitude}
+df_delta_wave_metrics_proc= df_delta_wave_metrics %>% 
+  left_join(df_rcs_overnight_duration, by=c("subject", "date", "stage")) %>% 
+  mutate(delta_rate = count/duration_min)
+
+# wave density
+colors = brewer.pal(n = 8, name = "Accent")
+df_delta_wave_metrics_proc %>% 
+  filter(subject != "RCS16",
+         stage != "N1",
+         # wave_type == "negative",
+         # hemisphere == "R"
+         ) %>% 
+  ggplot(aes(stage, delta_rate, fill=stage))+
+  geom_violin()+
+  geom_boxplot(width=0.1, fill = "white", outlier.size = 0.5)+
+  scale_fill_manual(values = c(colors[3], colors[1], colors[2]))+
+  labs(y="rate (w/min)", title="delta wave rate")+
+  theme_classic()
+
+# ggsave("figures/delta_wave_density.png", width = 3, height = 2)
+
+aov(delta_rate~stage, 
+    data = df_delta_wave_metrics_proc %>% 
+      filter(subject != "RCS16",
+             stage != "N1")) %>%
+  summary()
+
+# wave amplitude
+df_delta_wave_metrics_proc %>% 
+  filter(subject != "RCS16",
+         stage != "N1") %>% 
+  ggplot(aes(stage, amplitude, fill=stage))+
+  geom_violin()+
+  geom_boxplot(width=0.1, fill = "white", outlier.size = 0.5)+
+  scale_fill_manual(values = c(colors[3], colors[1], colors[2]))+
+  labs(title="delta wave amplitude", y = "amplitude (mV)")+
+  theme_classic()
+# ggsave("figures/delta_wave_amplitude.png", width = 3, height = 2)
+
+aov(amplitude~stage, 
+    data = df_delta_wave_metrics_proc %>% 
+      filter(subject != "RCS16",
+             stage != "N1")) %>%
+  summary()
+```
+
+```{r beta bursts density and amplitude}
+df_beta_bursts_metrics_proc = df_beta_bursts_metrics %>% 
+  left_join(df_rcs_overnight_duration, by=c("subject", "date", "stage")) %>% 
+  mutate(beta_rate = n_bursts/duration_min, 
+         beta_amp = peak_amplitude)
+
+# burst rate
+colors = brewer.pal(n = 8, name = "Accent")
+df_beta_bursts_metrics_proc %>% 
+  filter(subject != "RCS16",
+         stage %in% c("N2", "N3", "REM"),
+         ) %>% 
+  ggplot(aes(stage, beta_rate, fill=stage))+
+  geom_violin()+
+  geom_boxplot(width=0.1, fill = "white", outlier.size = 0.5)+
+  # scale_color_brewer(palette = "Accent")+
+  scale_fill_manual(values = c(colors[3], colors[1], colors[2]))+
+  labs(y="rate (n/min)", title="beta burst rate")+
+  theme_classic()
+
+# ggsave("figures/beta_burst_density.png", width = 3, height = 2)
+
+t.test(beta_rate~stage, var.equal = TRUE,
+    data = df_beta_bursts_metrics_proc %>% 
+      filter(subject != "RCS16",
+         stage %in% c("N3", "REM")))
+
+# burst amplitude
+df_beta_bursts_metrics_proc %>% 
+  filter(subject != "RCS16",
+         stage %in% c("N2", "N3", "REM")) %>% 
+  ggplot(aes(stage, beta_amp, fill=stage))+
+  geom_violin()+
+  geom_boxplot(width=0.1, fill = "white", outlier.size = 0.5)+
+  scale_fill_manual(values = c(colors[3], colors[1], colors[2]))+
+  labs(title="beta burst amplitude", y = "amplitude (mV)")+
+  theme_classic()
+# ggsave("figures/beta_burst_amplitude.png", width = 3, height = 2)
+
+t.test(beta_amp~stage, var.equal = TRUE,
+    data = df_beta_bursts_metrics_proc %>% 
+      filter(subject != "RCS16",
+         stage %in% c("N3", "REM")))
+```
+
+
+```{r analysis of detected delta waves and beta bursts}
+# overnight delta waves and beta bursts data + morning measures
+df_delta_beta_wave_morning_combined = df_delta_wave_metrics_proc %>% 
+  left_join(df_beta_bursts_metrics_proc %>% select(subject, channel, date, stage, beta_rate, beta_amp),
+            by = c('subject', 'channel', 'date', 'stage')) %>% 
+  mutate(delta_amp = log(amplitude),
+         sawtooth_total_dur = total_duration/60) %>% 
+  left_join(df_ep_trial %>% select(-channel),
+            by = c('subject', 'hemisphere', 'date')) %>% 
+  left_join(df_resting_psd_mean %>% filter(channel=="cortical") %>% select(-n_sec, -channel) ,
+            by = c("subject", "hemisphere", "date")) %>%
+  # by hemisphere scaling
+  group_by(subject, stage, hemisphere, channel, wave_type) %>%
+  mutate_at(c("beta_amp", "delta_amp", "beta_rate", "delta_rate"), .funs = scale) %>%
+  # add disease condition
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+# overnight PSD data + morning measures
+df_overnight_psd_key2 = df_overnight_psd %>% 
+  select(subject:high_delta_power) %>% 
+  rename(stage = sleep_stage) %>% 
+  filter(channel == "key2",
+         stage != "Awake") %>% 
+  group_by(subject, hemisphere, date, stage, channel) %>% 
+  summarise_if(is.numeric, mean)
+
+df_overnight_psd_morning_combined = df_overnight_psd_key2 %>% 
+  mutate(delta_power = log(delta_power),
+         high_delta_power = log(high_delta_power),
+         beta_power = log(beta_power)
+         ) %>%
+  arrange(subject, date, hemisphere, stage) %>% 
+  left_join(df_ep_trial %>% select(-channel), by = c('subject', 'hemisphere', 'date')) %>%
+  left_join(df_resting_psd_mean %>% filter(channel=="cortical") %>% select(-n_sec, -channel) ,
+            by = c("subject", "hemisphere", "date")) %>%
+  left_join(df_dreem_reports %>% # duration of sleep stages
+              mutate(date = as.character(record_stop_date_recreated)) %>% 
+              filter(tst > 0) %>% 
+              select(subject, date,
+                     n1_duration, n2_duration, n3_duration, rem_duration, tst) %>% 
+              pivot_longer(c(n1_duration, n2_duration, n3_duration, rem_duration, tst), 
+                           names_to = c("stage", "_"), names_sep ="_", values_to = "total_duration") %>% 
+              mutate(stage = str_to_upper(stage)) %>% 
+              mutate(stage = ifelse(stage == 'TST', "whole-night", stage),
+                     total_duration = total_duration/60) %>% 
+              select(subject, date, stage, total_duration),
+            by = c('subject', 'date', 'stage')) %>% 
+  # by hemisphere scaling
+  group_by(subject, stage, hemisphere, channel) %>%
+  mutate_at(c("beta_power", "delta_power", "high_delta_power"), .funs = scale) %>%
+  # add disease condition
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+
+# test all lmer models
+df_results = data_frame()
+outcome_variables = c("resting_beta_power", "EP_amp_main", "EP_beta_power")
+stages = c("REM", "N1", "N2", "N3")
+for (outcome_var in outcome_variables){
+  for (s in stages){
+    p1_label = "delta_amp"
+    p2_label = "delta_power"
+    p3_label = "delta_rate"
+    p4_label = "beta_amp"
+    p5_label = "beta_power"
+    p6_label = "beta_rate"
+    
+    # test for detected delta waves (filtered)
+    df1 = data_frame()
+    for (wave in c("negative", "positive")){
+      lmer_results1 = lmer(get(outcome_var) ~ get(p1_label) + (1|subject/hemisphere),
+                           REML = FALSE,
+                           data = df_delta_beta_wave_morning_combined %>% 
+                             filter(stage == s, disease == "PD", wave_type == wave)
+      )
+      df = lmer_results1 %>%
+        tidy() %>%
+        filter(effect == "fixed", term == "get(p1_label)") %>% 
+        select(-effect, -group, -term) %>% 
+        mutate(stage = s,
+               predictor = str_c(p1_label, str_sub(wave, 1, 3), sep="_"),
+               outcome_var = outcome_var,
+               n = lmer_results1@devcomp[["dims"]][["n"]])
+      df1 = df1 %>% bind_rows(df)
+    }
+    
+    # test for power
+    df2 = data_frame()
+    for (label in c(p2_label, p5_label)){
+      lmer_results2 = lmer(get(outcome_var) ~ get(label) + (1|subject/hemisphere),
+                           REML = FALSE,
+                           data = df_overnight_psd_morning_combined %>% 
+                             filter(stage == s, disease == "PD")
+      )
+      df = lmer_results2 %>%
+        tidy() %>%
+        filter(effect == "fixed", term == "get(label)") %>% 
+        select(-effect, -group, -term) %>% 
+        mutate(stage = s,
+               predictor = label,
+               outcome_var = outcome_var,
+               n = lmer_results2@devcomp[["dims"]][["n"]]) 
+      df2 = df2 %>% bind_rows(df)
+    }
+    
+    # test for other metrics
+    df3 = data_frame()
+    for (label in c(p3_label, p4_label, p6_label)){
+      lmer_results3 = lmer(get(outcome_var) ~ get(label) + (1|subject/hemisphere),
+                           REML = FALSE,
+                           data = df_delta_beta_wave_morning_combined %>% 
+                             filter(stage == s, disease == "PD", wave_type == "negative")
+      )
+      df = lmer_results3 %>%
+        tidy() %>%
+        filter(effect == "fixed", term == "get(label)") %>% 
+        select(-effect, -group, -term) %>% 
+        mutate(stage = s,
+               predictor = label,
+               outcome_var = outcome_var,
+               n = lmer_results3@devcomp[["dims"]][["n"]])
+      df3 = df3 %>% bind_rows(df)
+    }
+    
+    df_results = df_results %>% bind_rows(df1, df2, df3)
+  }}
+
+df_results = df_results %>% 
+  select(predictor, outcome_var, stage, everything()) %>% 
+  mutate(predictor = ifelse(predictor=="delta_amp_neg", "delta_amp", predictor)) %>% 
+  mutate(predictor = factor(predictor, 
+                            levels=c("delta_rate", "delta_amp_pos","delta_amp", "delta_power", 
+                                     "beta_rate", "beta_amp", "beta_power")),
+         outcome_var = factor(outcome_var, levels = outcome_variables))
+
+# print out z-stat
+df_results %>% 
+  filter(stage %in% c("N2", "N3", "REM"),
+         predictor %in% c("delta_amp", "delta_power", "delta_rate",
+                          "beta_amp", "beta_power", "beta_rate")
+         ) %>% 
+  group_by(predictor) %>% 
+  summarize(mean_z = mean(statistic),
+            sd_z = sd(statistic))
+
+# t-test of z-stat between stages
+t.test(statistic ~ stage, var.equal = TRUE,
+       data = df_results %>% 
+         filter(stage %in% c("N2", "N3", "REM"),
+                predictor %in% c("delta_amp", "delta_power", "delta_rate")
+                ) %>% 
+                  mutate(stage = ifelse(stage=="REM", "REM", "NREM"))
+         )
+
+t.test(statistic ~ stage, var.equal = TRUE,
+       data = df_results %>% 
+         filter(stage %in% c("N2", "N3", "REM"),
+                predictor %in% c("beta_amp", "beta_power", "beta_rate")
+                ) %>% 
+                  mutate(stage = ifelse(stage=="REM", "REM", "NREM"))
+         )
+
+# plot standardized coefficients
+df_results %>% 
+  filter(stage %in% c("N2", "N3", "REM"),
+         predictor %in% c("delta_amp", "delta_power", "delta_rate"),
+         ) %>% 
+  ggplot(aes(stage, statistic, fill=predictor))+
+  geom_hline(yintercept = -2, linetype="dashed", color="grey") +
+  geom_bar(stat="identity", 
+           position = position_dodge(), 
+           color="black"
+           )+
+  scale_fill_brewer(palette = "Set2")+
+  facet_wrap(.~outcome_var, 
+             ncol = 3)+
+  labs(x="sleep stage", 
+       y="LME t-stat", 
+       title="LME standardized coefficient of sleep delta metrics")+
+  theme_classic()
+# ggsave("figures/lmer_scaled_delta_stats_by_stage.png", width = 6, height = 2)
+
+df_results %>% 
+  filter(stage %in% c("N2", "N3", "REM"),
+         predictor %in% c("beta_amp", "beta_power", "beta_rate"),
+         ) %>% 
+  ggplot(aes(stage, statistic, fill=predictor))+
+  geom_hline(yintercept = 2, linetype="dashed", color="grey") +
+  geom_bar(stat="identity", 
+           position = position_dodge(), 
+           color="black"
+           )+
+  scale_fill_brewer(palette = "Set2")+
+  facet_wrap(.~outcome_var, 
+             ncol = 3)+
+  labs(x="sleep stage", 
+       y="LME t-stat", 
+       title="LME standardized coefficient of sleep beta metrics")+
+  theme_classic()
+# ggsave("figures/lmer_scaled_beta_stats_by_stage.png", width = 6, height = 2)
+
+```
+
+# Timing analysis
+```{r analysis of sleep delta over time}
+df_overnight_delta_power_summary = df_overnight_delta_power_by_hour_stage %>% 
+         mutate(cortical_psd = log(cortical_psd)) %>% 
+         mutate(subject = str_sub(SessionIdentity, 1, 2),
+                hemisphere = str_sub(SessionIdentity, 3, 3)) %>% 
+         group_by(subject, hemisphere, hour_num, stage) %>% 
+         summarise(cortical_psd = mean(cortical_psd))
+
+ggplot(df_overnight_delta_power_summary %>% 
+         filter(subject != "16",
+                hour_num <= 7), 
+       aes(hour_num, cortical_psd, color = stage))+
+  # geom_point(alpha = 0.3)+
+  stat_summary(geom="pointrange", 
+               # size = 0.15, 
+               position=position_dodge(0.2))+
+  stat_summary(geom="line", position=position_dodge(0.2))+
+  scale_color_brewer(palette = "Accent")+
+  labs(x="time during night recording (hour)", y="delta power", title = "sleep delta power by hour")+
+  theme_classic()
+# ggsave("figures/stage_delta_power_by_hour.png", width = 3.5, height = 2)
+
+
+# test linear trend of REM delta
+lm(cortical_psd~hour_num, 
+   data = df_overnight_delta_power_summary %>% 
+     filter(stage=="REM") %>% 
+     filter(subject != "16", 
+            hour_num >= 2)) %>% 
+  summary()
+
+df_overnight_delta_morning_combined = df_overnight_delta_power_by_hour_stage %>% 
+  mutate(cortical_psd = log(cortical_psd),
+         key2_psd = log(key2_psd),
+         key3_psd = log(key3_psd)) %>% 
+  mutate(subject = str_c("RCS", str_sub(SessionIdentity, 1, 2)),
+         hemisphere = str_sub(SessionIdentity, 3, 3),
+         date = str_sub(SessionIdentity, 5, -1)) %>% 
+  left_join(df_ep_trial %>%
+              mutate(date_r = strftime(strptime(date, format = "%Y-%m-%d"), format = "%m-%d-%y"),
+                     SessionIdentity = str_c(str_sub(subject, 4, 5), hemisphere, "_", date_r)) %>% 
+               select(SessionIdentity, EP_amp_early, EP_amp_main, EP_beta_power),
+             by = "SessionIdentity") %>%
+  left_join(df_resting_psd_mean %>%
+              filter(channel == "cortical") %>% 
+              mutate(date_r = strftime(strptime(date, format = "%Y-%m-%d"), format = "%m-%d-%y"),
+                     SessionIdentity = str_c(str_sub(subject, 4, 5), hemisphere, "_", date_r)) %>% 
+               select(SessionIdentity, resting_beta_power),
+             by = "SessionIdentity") %>% 
+  # by hemisphere scaling
+  group_by(subject, stage, hemisphere) %>%
+  mutate_at(c("cortical_psd", "key2_psd", "key3_psd"), .funs = scale) %>%
+  ungroup() %>%
+  # add disease condition
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+
+outcome_variables = c("resting_beta_power", "EP_amp_main", "EP_beta_power")
+df_results = data_frame()
+for (var in outcome_variables){
+  for (hour in seq(1, 7)){
+    for (s in c("REM", "NREM")){
+    df_test = df_overnight_delta_morning_combined %>% 
+                        filter(disease == "PD", 
+                               stage == s,
+                               hour_num==hour)
+    if (df_test %>% nrow()>20){
+    message("DV:", var, " hour",hour, " ", s)
+    # lmer(get(var) ~ cortical_psd + (1|subject/hemisphere),
+    #                   REML = FALSE,
+    #                   data = df_test) %>% 
+    #   summary() %>% 
+    #   print()
+    
+    lmer = lmer(get(var) ~ cortical_psd + (1|subject/hemisphere),
+                      REML = FALSE,
+                      data = df_test)
+    df = lmer %>%
+      tidy() %>%
+      filter(effect == "fixed", term == "cortical_psd") %>% 
+      mutate(hour_num = hour,
+             outcome_var = var,
+             stage = s,
+             n = lmer@devcomp[["dims"]][["n"]])
+    df_results = df_results %>% bind_rows(df)
+    }}}}
+df_results
+
+# FDR correction of p-values
+df_results_adjusted = data.frame()
+for (var in outcome_variables){
+  df_results_var = df_results %>% filter(outcome_var == var)
+  p_values = df_results_var$`p.value`
+  p_adjusted <- p.adjust(p_values, method = "fdr")
+  
+  df_results_var = df_results_var %>% 
+    mutate(p_adjust = p_adjusted)
+  
+  df_results_adjusted = bind_rows(df_results_adjusted, df_results_var)
+}
+df_results_adjusted %>% 
+  filter(p_adjust < 0.05) %>% 
+  print()
+
+# plot LME coefficient by hour
+ggplot(df_results %>% 
+         mutate(outcome_var = factor(outcome_var, levels = outcome_variables)) %>% 
+         filter(n>20), 
+       aes(hour_num, estimate, color = stage))+
+  geom_hline(yintercept = 0, linetype="dashed", color="grey") +
+  geom_pointrange(aes(ymin=estimate-qnorm(0.975)*std.error, 
+                      ymax = estimate+qnorm(0.975)*std.error),
+                  # size = 0.25,
+                  position = position_dodge(0.3))+
+  geom_line(position = position_dodge(0.3)) +
+  labs(x="time during night recording (hour)", 
+       y="LME coefficient",
+       title="LME coefficient of delta power by hour")+
+  # xlim(0, 7)+
+  scale_color_brewer(palette = "Accent")+
+  facet_wrap(.~outcome_var, 
+             ncol = 3,
+             scales = "free_y")+
+  theme_classic()
+# ggsave("figures/lmer_scaled_delta_coef_by_hour_by_stage.png", width = 6, height = 2)
+```
+
+```{r analysis of sleep stage percentage overtime}
+df_stage_duration_by_hour = df_dreem_hypnogram %>% 
+  group_by(subject, date) %>%
+  mutate(cum_duration = cumsum(`Duration[s]`),
+         hour_num = ceiling(cum_duration/3600),
+         stage = str_sub(`Sleep Stage`, 7, -1),
+         stage = case_when(stage=="REM" ~ "REM",
+                           stage %in% c("S2", "S3") ~ "NREM",
+                           stage=="S0" ~ "Awake",
+                           TRUE ~ "other"),
+         # stage = factor(stage, levels = c("NREM", "REM", "Awake", "other"))
+         ) %>% 
+  group_by(subject, date, hour_num) %>% 
+  mutate(hour_duration = sum(`Duration[s]`)) %>% 
+  group_by(subject, date, hour_num, stage) %>% 
+  summarise(stage_duration = sum(`Duration[s]`),
+            hour_duration = mean(hour_duration)) %>% 
+  filter(hour_duration > 1200) %>% # the hour segment has to be long enough, 1200s = 20min
+  ungroup() %>% 
+  mutate(stage_portion = stage_duration/hour_duration,
+         date = strftime(strptime(date, format = "%d-%b-%Y"), format = "%Y-%m-%d"))
+
+ggplot(df_stage_duration_by_hour %>% 
+         filter(subject != "RCS16", 
+                hour_num <= 7,
+                stage %in% c("NREM", "REM")) %>% 
+         #complete stage_portion for missing REM stage in some hour_num with 0
+         complete(nesting(subject, date, hour_num), stage, 
+                  fill = list(stage_duration=0, stage_portion=0)) %>% 
+         group_by(subject, hour_num, stage) %>% # summarize at subject level
+         summarise(stage_portion = mean(stage_portion)), 
+       aes(hour_num, stage_portion))+
+  stat_summary(aes(fill = stage),
+               fun.data = "mean_cl_boot",
+               geom = "ribbon", alpha = 0.3)+
+  stat_summary(aes(color = stage),
+               geom="line")+
+  scale_color_brewer(palette = "Accent")+
+  scale_fill_brewer(palette = "Accent")+
+  scale_y_continuous(limits = c(0,1)) +
+  labs(x="time during night recording (hour)", 
+       y="percentage",
+       title="stage percentage by hour")+
+  theme_classic()
+# ggsave("figures/stage_portion_by_hour.png", width = 3.5, height = 2)
+
+# test linear trend of stage percentage
+lm(stage_portion~hour_num, 
+   data = df_stage_duration_by_hour %>% 
+     filter(stage=="REM") %>% 
+     filter(subject != "16")) %>% 
+  summary()
+
+# first-half vs. second-half t-test
+t.test(stage_portion~(hour_num<=4), 
+       var.equal = TRUE,
+   data = df_stage_duration_by_hour %>% 
+     filter(stage=="NREM") %>% 
+     filter(subject != "16"))
+
+df_stage_duration_by_hour_morning_combined = df_stage_duration_by_hour %>% 
+  left_join(df_ep_trial,
+            by = c("subject", "date")) %>%
+  left_join(df_resting_psd_mean %>%
+              filter(channel == "cortical") %>% 
+              select(subject, date, hemisphere, resting_beta_power),
+            by = c("subject", "date", "hemisphere")) %>% 
+  # add disease condition
+  mutate(disease = ifelse(subject == "RCS16", "dystonia", "PD"),
+         subc_site = ifelse(subject %in% c("RCS02", "RCS07"), "STN", "GP"))
+
+
+outcome_variables = c("resting_beta_power", "EP_amp_main", "EP_beta_power")
+df_results = data_frame()
+for (var in outcome_variables){
+  for (hour in seq(1, 7)){
+    for (s in c("REM", "NREM")){
+    df_test = df_stage_duration_by_hour_morning_combined %>% 
+                        filter(disease == "PD", 
+                               stage == s,
+                               hour_num==hour)
+    if (df_test %>% nrow()>20){
+    message("DV:", var, " hour",hour, " ", s)
+    # lmer(get(var) ~ stage_portion + (1|subject/hemisphere),
+    #                   REML = FALSE,
+    #                   data = df_test) %>% 
+    #   summary() %>% 
+    #   print()
+    lmer = lmer(get(var) ~ stage_portion + (1|subject/hemisphere),
+                      REML = FALSE,
+                      data = df_test)
+    df = lmer %>%
+      tidy() %>%
+      filter(effect == "fixed", term == "stage_portion") %>% 
+      mutate(hour_num = hour,
+             outcome_var = var,
+             stage = s,
+             n = lmer@devcomp[["dims"]][["n"]])
+    df_results = df_results %>% bind_rows(df)
+    }}}}
+df_results
+
+# FDR correction of p-values
+df_results_adjusted = data.frame()
+for (var in outcome_variables){
+  df_results_var = df_results %>% filter(outcome_var == var)
+  p_values = df_results_var$`p.value`
+  p_adjusted <- p.adjust(p_values, method = "fdr")
+  
+  df_results_var = df_results_var %>% 
+    mutate(p_adjust = p_adjusted)
+  
+  df_results_adjusted = bind_rows(df_results_adjusted, df_results_var)
+}
+df_results_adjusted %>% 
+  filter(p_adjust < 0.05) %>%
+  print()
+
+
+ggplot(df_results %>% 
+         mutate(outcome_var = factor(outcome_var, levels = outcome_variables)) %>% 
+         filter(n>20,
+                (stage=="REM" & hour_num>=3)|(stage=="NREM")), 
+       aes(hour_num, estimate, color = stage))+
+  geom_hline(yintercept = 0, linetype="dashed", color="grey") +
+  geom_pointrange(aes(ymin=estimate-qnorm(0.975)*std.error,
+                      ymax = estimate+qnorm(0.975)*std.error),
+                  position = position_dodge(0.3))+
+  geom_line(position = position_dodge(0.3)) +
+  labs(x="time during night recording (hour)", 
+       y="LME coefficient",
+       title="LME coefficient of sleep stage percentage by hour")+
+  # xlim(0, 7)+
+  scale_color_brewer(palette = "Accent")+
+  facet_wrap(.~outcome_var, 
+             ncol = 3,
+             scales = "free_y")+
+  theme_classic()
+# ggsave("figures/lmer_duration_coef_by_hour_by_stage.png", width = 6, height = 2)
+```
+
+# Self-report morning alertness
+```{r LME models on self-report alertness}
+# relationship between sleepiness and restedness
+cor.test(~sleepiness+restedness, 
+         data = df_survey_dreem_combined %>% filter(subject != "RCS16"))
+
+# spectral power LME models
+outcome_variables = c("sleepiness", "restedness")
+lmer_results_self_report = data_frame()
+
+df_overnight_morning_combined_lmer = df_overnight_morning_combined %>% 
+  pivot_wider(names_from = sleep_stage, values_from = c("delta_power", "theta_power", "alpha_power", "beta_power", 
+                                                        "low_delta_power", "gamma_power", "entrained_gamma"),
+              id_cols = c("subject", "hemisphere", "date", "channel", "disease", "subc_site",
+                          all_of(outcome_variables))) %>%
+    rename(NREM_beta = beta_power_NREM,
+           REM_beta = beta_power_REM,
+           NREM_delta = delta_power_NREM,
+           REM_delta = delta_power_REM,)
+
+for (var in outcome_variables){
+  # power predictors
+  df_power = df_overnight_morning_combined_lmer %>%
+    rename(outcome_var = var) %>%
+    filter(disease == "PD")
+  lmer_power = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta + (1|subject),
+                    REML = FALSE, data = df_power)
+  lmer_power %>% summary(corr = FALSE) %>% print()
+  df_result_power = lmer_power %>%
+    tidy() %>%
+    filter(effect == "fixed",
+           term != "(Intercept)") %>%
+    mutate(model = var, model_type='power')
+
+  # combine results
+  lmer_results_self_report = lmer_results_self_report %>% bind_rows(df_result_dur, df_result_lat, df_result_power)
+}
+
+
+# relatioship with neurophysiology
+df_self_report_morning = df_overnight_morning_combined %>% 
+  filter(sleep_stage=="REM")
+
+outcome_variables = c("EP_amp_early", "EP_amp_main", "EP_beta_power")
+for (var in outcome_variables){
+  df = df_self_report_morning %>%
+    rename(outcome_var = var) %>% 
+    filter(disease == "PD")
+  
+  message("\n\n outcome variable:", var, "\n")
+  lmer(outcome_var ~ sleepiness + (1|subject/hemisphere), REML = FALSE, data = df) %>%
+    summary(corr=F) %>% print()
+  lmer(outcome_var ~ restedness + (1|subject/hemisphere), REML = FALSE, data = df) %>%
+    summary(corr=F) %>% print()
+  message("\n")
+}
+```
+
+# Exploratory analyses
+```{r exploratory spectral power models (all power bands)}
+band_of_interest = c("delta_power", "theta_power", "alpha_power", "beta_power",
+                     "gamma_power", "entrained_gamma" )
+outcome_variables = c("resting_beta_power", "EP_amp_early", "EP_amp_main", "EP_beta_power")
+
+lmer_results_power = data_frame()
+for (var in outcome_variables){
+  cat(str_c("\n\noutcome variables:", var, "\n"))
+  for (band in band_of_interest){
+    message(band)
+    df_test = df_overnight_morning_combined %>% 
+      filter(channel == "cortical", disease == "PD") %>% 
+      pivot_longer(cols = band_of_interest,
+                   names_to = "band_name", values_to = "power") %>% 
+      filter(band_name == band) %>% 
+      pivot_wider(names_from = sleep_stage, values_from = c("power"), names_prefix = "power_",
+                  id_cols = c("subject", "hemisphere", "date", "channel", "disease", "subc_site", "band_name",
+                              var)) %>% 
+      rename(outcome_var = var)
+
+    # NREM and REM separate
+    lmer_NREM = lmer(outcome_var ~ power_NREM + (1|subject/hemisphere),
+                     REML = FALSE,
+                     data = df_test)
+    df_result_NREM = lmer_NREM %>%
+      tidy() %>%
+      filter(effect == "fixed",
+             term != "(Intercept)") %>%
+      mutate(band = band,
+             type = "separate")
+    
+    lmer_REM = lmer(outcome_var ~ power_REM + (1|subject/hemisphere),
+                    REML = FALSE,
+                    data = df_test)
+    df_result_REM = lmer_REM %>%
+      tidy() %>%
+      filter(effect == "fixed",
+             term != "(Intercept)") %>%
+      mutate(band = band,
+             type = "separate")
+    
+    lmer_results_power = lmer_results_power %>% 
+      bind_rows(bind_rows(df_result, df_result_NREM, df_result_REM) %>% 
+                  mutate(outcome = var))
+  }
+}
+
+for(outcome_var in outcome_variables){
+  lmer_results_power %>% 
+    filter(type=="separate",
+           outcome==outcome_var) %>% 
+    mutate(band = factor(band, levels=band_of_interest)) %>% 
+    mutate(
+      # Create significance levels
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01 ~ "**", 
+        p.value < 0.05 ~ "*",
+        TRUE ~ "")) %>% 
+    separate(term, into = c("predictor", "stage"), sep = "_") %>% 
+    ggplot(aes(estimate, stage, color=band))+
+    geom_vline(xintercept = 0, linetype="dashed", color="grey") +
+    geom_pointrange(aes(xmin=estimate-qnorm(0.975)*std.error, 
+                        xmax =estimate+qnorm(0.975)*std.error),
+                    size=0.6, stroke = 1, shape=21, fill="white",
+                    position = position_dodge(0.5))+
+  geom_text(aes(estimate, stage, label = significance, group=band), 
+            color = "black",
+            position = position_dodge(0.5),
+          size = 6, vjust = 0.1) +
+    labs(x='LME coefficient', y='stage', 
+         title=str_c("outcome variable: ", outcome_var),
+         color="predictor")+
+    facet_wrap(~band, 
+               # scales = "free",
+               ncol=2)+ 
+    theme_classic()+
+    theme(legend.position = "right", 
+          plot.title = element_text(hjust = 0.5))
+  
+  # ggsave(str_c("figures/lmer_coef_", outcome_var, "_with_all_band_separate.png"), width = 6, height = 4)
+}
+```
+
+```{r R session info}
+sessionInfo()
+```
