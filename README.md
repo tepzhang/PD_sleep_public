@@ -11,6 +11,7 @@ Package versions: refer to sessionInfo() in analysis_code.html
 # Demo
 - In RStudio, run chunk by chunk of analysis_code.Rmd
 - Expected output and run time are in analysis_code.html
+- Expected runtime: 10 min
 
 # Instructions for use
 - R and RStudio: https://rstudio-education.github.io/hopr/starting.html
