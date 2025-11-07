@@ -1,7 +1,7 @@
 # System requirements
-R version 4.2.1 (2022-06-23)
-Platform: x86_64-apple-darwin17.0 (64-bit)
-Running under: macOS Big Sur ... 10.16
+R version 4.2.1 (2022-06-23)  
+Platform: x86_64-apple-darwin17.0 (64-bit)  
+Running under: macOS Big Sur ... 10.16  
 Package versions: refer to sessionInfo() in analysis_code.html
 
 # Installation guide
