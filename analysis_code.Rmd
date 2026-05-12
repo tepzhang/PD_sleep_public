@@ -207,26 +207,56 @@ for (var in outcome_variables){
     filter(disease == "PD")
   message("\n\n outcome variable:", var, "\n")
   
-  lmer_duration = lmer(outcome_var ~ NREM_duration + REM_duration + (1|subject/hemisphere), 
+  # LME model: resting beta ~ NREM/REM duration
+  lmer_duration = lmer(outcome_var ~ NREM_duration + REM_duration + (1|subject/hemisphere),
                              REML = FALSE,
                              data = df)
   lmer_duration %>% summary() %>% print()
   df_result_dur = lmer_duration %>%
     tidy() %>%
     filter(effect == "fixed",
-           term != "(Intercept)") %>% 
+           term != "(Intercept)") %>%
     mutate(model = var)
-  
-  lmer_latency = lmer(outcome_var ~ NREM_latency + REM_latency + (1|subject/hemisphere), 
+
+  # Effect size: within-person partial R² for REM_duration
+  df_centered_dur = df %>%
+    group_by(subject) %>%
+    mutate(
+      REM_duration_mean   = mean(REM_duration, na.rm = TRUE),
+      REM_duration_within = REM_duration - REM_duration_mean
+    ) %>% ungroup()
+  m_full    = lmer(outcome_var ~ NREM_duration + REM_duration_mean + REM_duration_within + (1|subject/hemisphere),
+                   REML = FALSE, data = df_centered_dur)
+  m_reduced = lmer(outcome_var ~ NREM_duration + REM_duration_mean + (1|subject/hemisphere),
+                   REML = FALSE, data = df_centered_dur)
+  message("Effect size (within partial R²) — REM_duration: ",
+          round((sigma(m_reduced)^2 - sigma(m_full)^2) / sigma(m_reduced)^2, 4))
+
+  # LME model: resting beta ~ NREM/REM latency
+  lmer_latency = lmer(outcome_var ~ NREM_latency + REM_latency + (1|subject/hemisphere),
                             REML = FALSE,
                             data = df)
   lmer_latency %>% summary() %>% print()
   df_result_lat = lmer_latency %>%
     tidy() %>%
     filter(effect == "fixed",
-           term != "(Intercept)") %>% 
+           term != "(Intercept)") %>%
     mutate(model = var)
-  
+
+  # Effect size: within-person partial R² for REM_latency
+  df_centered_lat = df %>%
+    group_by(subject) %>%
+    mutate(
+      REM_latency_mean   = mean(REM_latency, na.rm = TRUE),
+      REM_latency_within = REM_latency - REM_latency_mean
+    ) %>% ungroup()
+  m_full    = lmer(outcome_var ~ NREM_latency + REM_latency_mean + REM_latency_within + (1|subject/hemisphere),
+                   REML = FALSE, data = df_centered_lat)
+  m_reduced = lmer(outcome_var ~ NREM_latency + REM_latency_mean + (1|subject/hemisphere),
+                   REML = FALSE, data = df_centered_lat)
+  message("Effect size (within partial R²) — REM_latency: ",
+          round((sigma(m_reduced)^2 - sigma(m_full)^2) / sigma(m_reduced)^2, 4))
+
   lmer_results_resting = lmer_results_resting %>% bind_rows(df_result_dur, df_result_lat)
   
   # scatter plot
@@ -331,37 +361,68 @@ for (var in outcome_variables){
   df = df_ep_sleep_combined %>%
     rename(outcome_var = var)
 
-  lmer_EP_duration = lmer(outcome_var ~ NREM_duration + REM_duration + (1|subject/hemisphere), 
+  # LME model: EP outcome ~ NREM/REM duration
+  lmer_EP_duration = lmer(outcome_var ~ NREM_duration + REM_duration + (1|subject/hemisphere),
                           REML = FALSE,
-                          data = df %>% 
+                          data = df %>%
                             filter(disease == "PD"))
-  lmer_EP_duration %>% 
-    summary(corr = FALSE) %>% 
+  lmer_EP_duration %>%
+    summary(corr = FALSE) %>%
     print()
-  
+
   df_result = lmer_EP_duration %>%
     tidy() %>%
     filter(effect == "fixed",
-           term != "(Intercept)") %>% 
+           term != "(Intercept)") %>%
     mutate(model = var)
   lmer_results_dur = lmer_results_dur %>% bind_rows(df_result)
-  
-  
-  lmer_EP_latency = lmer(outcome_var ~ REM_latency + NREM_latency + (1|subject/hemisphere), 
+
+  # Effect size: within-person partial R² for REM_duration
+  df_ep_centered_dur = df %>%
+    filter(disease == "PD") %>%
+    group_by(subject) %>%
+    mutate(
+      REM_duration_mean   = mean(REM_duration, na.rm = TRUE),
+      REM_duration_within = REM_duration - REM_duration_mean
+    ) %>% ungroup()
+  m_full    = lmer(outcome_var ~ NREM_duration + REM_duration_mean + REM_duration_within + (1|subject/hemisphere),
+                   REML = FALSE, data = df_ep_centered_dur)
+  m_reduced = lmer(outcome_var ~ NREM_duration + REM_duration_mean + (1|subject/hemisphere),
+                   REML = FALSE, data = df_ep_centered_dur)
+  message("Effect size (within partial R²) — REM_duration: ",
+          round((sigma(m_reduced)^2 - sigma(m_full)^2) / sigma(m_reduced)^2, 4))
+
+  # LME model: EP outcome ~ NREM/REM latency
+  lmer_EP_latency = lmer(outcome_var ~ REM_latency + NREM_latency + (1|subject/hemisphere),
                          REML = FALSE,
                          data = df %>%
                            filter(disease == "PD"))
-  lmer_EP_latency %>% 
-    summary(corr = FALSE) %>% 
+  lmer_EP_latency %>%
+    summary(corr = FALSE) %>%
     print()
-  
+
   df_result = lmer_EP_latency %>%
-    tidy() %>%  
+    tidy() %>%
     filter(effect == "fixed",
-           term != "(Intercept)") %>% 
+           term != "(Intercept)") %>%
     mutate(model = var)
   lmer_results_latency = lmer_results_latency %>% bind_rows(df_result)
-  
+
+  # Effect size: within-person partial R² for REM_latency
+  df_ep_centered_lat = df %>%
+    filter(disease == "PD") %>%
+    group_by(subject) %>%
+    mutate(
+      REM_latency_mean   = mean(REM_latency, na.rm = TRUE),
+      REM_latency_within = REM_latency - REM_latency_mean
+    ) %>% ungroup()
+  m_full    = lmer(outcome_var ~ NREM_latency + REM_latency_mean + REM_latency_within + (1|subject/hemisphere),
+                   REML = FALSE, data = df_ep_centered_lat)
+  m_reduced = lmer(outcome_var ~ NREM_latency + REM_latency_mean + (1|subject/hemisphere),
+                   REML = FALSE, data = df_ep_centered_lat)
+  message("Effect size (within partial R²) — REM_latency: ",
+          round((sigma(m_reduced)^2 - sigma(m_full)^2) / sigma(m_reduced)^2, 4))
+
   # scatter plots
   lmer_combined = lmer_EP_duration %>%
     augment() %>%
@@ -507,21 +568,35 @@ for (var in outcome_variables){
     rename(outcome_var = var) %>% 
     filter(disease == "PD")
   
-  # print(df)
+  # LME model: morning outcome ~ NREM/REM spectral power
   lmer = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta + (1|subject/hemisphere),
               REML = FALSE,
               data = df)
   lmer %>%
     summary(corr = FALSE) %>%
     print()
-  
+
   df_result = lmer %>%
     tidy() %>%
     filter(effect == "fixed",
-           term != "(Intercept)") %>% 
+           term != "(Intercept)") %>%
     mutate(model = var)
-  
+
   lmer_results_power = lmer_results_power %>% bind_rows(df_result)
+
+  # Effect size: within-person partial R² for REM_delta
+  df_centered_pow = df %>%
+    group_by(subject) %>%
+    mutate(
+      REM_delta_mean   = mean(REM_delta, na.rm = TRUE),
+      REM_delta_within = REM_delta - REM_delta_mean
+    ) %>% ungroup()
+  m_full    = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta_mean + REM_delta_within + (1|subject/hemisphere),
+                   REML = FALSE, data = df_centered_pow)
+  m_reduced = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta_mean + (1|subject/hemisphere),
+                   REML = FALSE, data = df_centered_pow)
+  message("Effect size (within partial R²) — REM_delta: ",
+          round((sigma(m_reduced)^2 - sigma(m_full)^2) / sigma(m_reduced)^2, 4))
 }
 
 # plot LME coefficients
@@ -1154,6 +1229,7 @@ for (var in outcome_variables){
   df_power = df_overnight_morning_combined_lmer %>%
     rename(outcome_var = var) %>%
     filter(disease == "PD")
+  # LME model: self-report alertness ~ NREM/REM spectral power
   lmer_power = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta + (1|subject),
                     REML = FALSE, data = df_power)
   lmer_power %>% summary(corr = FALSE) %>% print()
@@ -1162,6 +1238,20 @@ for (var in outcome_variables){
     filter(effect == "fixed",
            term != "(Intercept)") %>%
     mutate(model = var, model_type='power')
+
+  # Effect size: within-person partial R² for REM_delta
+  df_sr_centered_pow = df_power %>%
+    group_by(subject) %>%
+    mutate(
+      REM_delta_mean   = mean(REM_delta, na.rm = TRUE),
+      REM_delta_within = REM_delta - REM_delta_mean
+    ) %>% ungroup()
+  m_full    = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta_mean + REM_delta_within + (1|subject),
+                   REML = FALSE, data = df_sr_centered_pow)
+  m_reduced = lmer(outcome_var ~ NREM_beta + REM_beta + NREM_delta + REM_delta_mean + (1|subject),
+                   REML = FALSE, data = df_sr_centered_pow)
+  message("Effect size (within partial R²) — REM_delta: ",
+          round((sigma(m_reduced)^2 - sigma(m_full)^2) / sigma(m_reduced)^2, 4))
 
   # combine results
   lmer_results_self_report = lmer_results_self_report %>% bind_rows(df_result_dur, df_result_lat, df_result_power)
