@@ -605,8 +605,9 @@ for (var in outcome_variables){
     pivot_longer(cols = c("NREM_beta", "REM_beta", "NREM_delta", "REM_delta"),
                  names_to = "predictor", values_to = "power") %>%
     mutate(predictor = factor(predictor, levels = c("REM_delta", "REM_beta", "NREM_delta", "NREM_beta"))) %>%
-    filter(predictor %in% c("REM_delta", "REM_beta")) %>%
-    # filter(predictor %in% c("REM_delta", "NREM_beta")) %>% # use for resting_beta_power
+    # resting beta outcomes show NREM_beta instead of REM_beta
+    filter(predictor %in% if (var %in% c("resting_beta_power", "beta_burst_rate")) c("REM_delta", "NREM_beta")
+                          else c("REM_delta", "REM_beta")) %>%
     ggplot(aes(power, outcome_var,
                color = subject, shape = hemisphere,
                grouping = interaction(subject, hemisphere)))+
@@ -627,40 +628,45 @@ for (var in outcome_variables){
 
 # plot LME coefficients
 lmer_results = lmer_results_power
-lmer_results %>% 
-  mutate(outcome = factor(model, levels=outcome_variables)) %>% 
-  mutate(
-    # Create significance levels
-    significance = case_when(
-      p.value < 0.001 ~ "***",
-      p.value < 0.01 ~ "**", 
-      p.value < 0.05 ~ "*",
-      # p.value < 0.1 ~ "'",
-      TRUE ~ "")) %>% 
-  # filter(outcome != 'resting_beta_power') %>%
-  separate(term, into = c("stage", "predictor"), sep = "_") %>% 
-  ggplot(aes(estimate, stage, color=predictor))+
-  geom_vline(xintercept = 0, linetype="dashed", color="grey") +
-  geom_pointrange(aes(xmin=estimate-qnorm(0.975)*std.error, 
-                      xmax =estimate+qnorm(0.975)*std.error),
-                  size=0.6, stroke = 1, shape=21, fill="white",
-                  position = position_dodge(0.5))+
-  geom_text(aes(estimate, stage, label = significance, group=predictor), 
-            color = "black",
-            position = position_dodge(0.5),
-          size = 6, vjust = 0.1) +
-  scale_color_brewer(palette = "Accent")+ # for power predictors
-  labs(x='LME coefficient', y='stage')+
-  facet_wrap(~outcome, 
-             scales = "free",
-             ncol=1)+ 
-  scale_x_continuous(n.breaks = 4)+ 
-  theme_classic()+
-  theme(legend.position = "right")
-
-# ggsave("figures/lmer_coef_morning_outcomes_with_sleep_power_combined.pdf", width = 3.5, height = 7)
-# ggsave("figures/lmer_coef_morning_resting_beta_with_sleep_power_combined.pdf", width = 3.5, height = 1.5)
-# ggsave("figures/lmer_coef_morning_EP_outcomes_with_sleep_power_combined.pdf", width = 3.5, height = 4)
+# separate plots for resting beta power and EP outcomes
+coef_plots = list(
+  resting_beta = list(outcomes = c("resting_beta_power"), height = 1.5),
+  EP_outcomes = list(outcomes = c("EP_amp_early", "EP_amp_main", "EP_beta_power"), height = 4))
+for (plot_name in names(coef_plots)){
+  p = lmer_results %>%
+    mutate(outcome = factor(model, levels=outcome_variables)) %>%
+    mutate(
+      # Create significance levels
+      significance = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01 ~ "**",
+        p.value < 0.05 ~ "*",
+        # p.value < 0.1 ~ "'",
+        TRUE ~ "")) %>%
+    filter(outcome %in% coef_plots[[plot_name]]$outcomes) %>%
+    separate(term, into = c("stage", "predictor"), sep = "_") %>%
+    ggplot(aes(estimate, stage, color=predictor))+
+    geom_vline(xintercept = 0, linetype="dashed", color="grey") +
+    geom_pointrange(aes(xmin=estimate-qnorm(0.975)*std.error,
+                        xmax =estimate+qnorm(0.975)*std.error),
+                    size=0.6, stroke = 1, shape=21, fill="white",
+                    position = position_dodge(0.5))+
+    geom_text(aes(estimate, stage, label = significance, group=predictor),
+              color = "black",
+              position = position_dodge(0.5),
+            size = 6, vjust = 0.1) +
+    scale_color_brewer(palette = "Accent")+ # for power predictors
+    labs(x='LME coefficient', y='stage')+
+    facet_wrap(~outcome,
+               scales = "free",
+               ncol=1)+
+    scale_x_continuous(n.breaks = 4)+
+    theme_classic()+
+    theme(legend.position = "right")
+  print(p)
+  # ggsave(str_c("figures/lmer_coef_morning_", plot_name, "_with_sleep_power_combined.pdf"), p,
+  #        width = 3.5, height = coef_plots[[plot_name]]$height)
+}
 ```
 
 # Delta waves and beta bursts during sleep
@@ -685,11 +691,15 @@ df_delta_wave_metrics_proc %>%
   theme_classic()
 # ggsave("figures/delta_wave_density.pdf", width = 3, height = 2)
 
-aov(delta_rate~stage, 
-    data = df_delta_wave_metrics_proc %>% 
-      filter(subject != "RCS16",
-             stage != "N1")) %>%
-  summary()
+df_paired = df_delta_wave_metrics_proc %>%
+  filter(subject != "RCS16",
+         stage %in% c("N2", "N3", "REM")) %>%
+  group_by(subject, date, hemisphere, stage) %>%
+  summarise(delta_rate = mean(delta_rate), .groups = "drop") %>%
+  pivot_wider(names_from = stage, values_from = delta_rate) %>%
+  drop_na(N2, N3, REM)
+t.test(df_paired$N3, df_paired$REM, paired = TRUE)
+t.test(df_paired$N2, df_paired$REM, paired = TRUE)
 
 # wave amplitude
 df_delta_wave_metrics_proc %>% 
@@ -703,11 +713,15 @@ df_delta_wave_metrics_proc %>%
   theme_classic()
 # ggsave("figures/delta_wave_amplitude.pdf", width = 3, height = 2)
 
-aov(amplitude~stage, 
-    data = df_delta_wave_metrics_proc %>% 
-      filter(subject != "RCS16",
-             stage != "N1")) %>%
-  summary()
+df_paired = df_delta_wave_metrics_proc %>%
+  filter(subject != "RCS16",
+         stage %in% c("N2", "N3", "REM")) %>%
+  group_by(subject, date, hemisphere, stage) %>%
+  summarise(amplitude = mean(amplitude), .groups = "drop") %>%
+  pivot_wider(names_from = stage, values_from = amplitude) %>%
+  drop_na(N2, N3, REM)
+t.test(df_paired$N3, df_paired$REM, paired = TRUE)
+t.test(df_paired$N2, df_paired$REM, paired = TRUE)
 ```
 
 ```{r beta bursts density and amplitude}
@@ -731,10 +745,14 @@ df_beta_bursts_metrics_proc %>%
   theme_classic()
 # ggsave("figures/beta_burst_density.pdf", width = 3, height = 2)
 
-t.test(beta_rate~stage, var.equal = TRUE,
-    data = df_beta_bursts_metrics_proc %>% 
-      filter(subject != "RCS16",
-         stage %in% c("N3", "REM")))
+df_paired = df_beta_bursts_metrics_proc %>%
+  filter(subject != "RCS16",
+         stage %in% c("N2", "N3", "REM")) %>%
+  select(subject, date, channel, stage, beta_rate) %>%
+  pivot_wider(names_from = stage, values_from = beta_rate) %>%
+  drop_na(N2, N3, REM)
+t.test(df_paired$N3, df_paired$REM, paired = TRUE)
+t.test(df_paired$N2, df_paired$REM, paired = TRUE)
 
 # burst amplitude
 df_beta_bursts_metrics_proc %>% 
@@ -748,10 +766,14 @@ df_beta_bursts_metrics_proc %>%
   theme_classic()
 # ggsave("figures/beta_burst_amplitude.pdf", width = 3, height = 2)
 
-t.test(beta_amp~stage, var.equal = TRUE,
-    data = df_beta_bursts_metrics_proc %>% 
-      filter(subject != "RCS16",
-         stage %in% c("N3", "REM")))
+df_paired = df_beta_bursts_metrics_proc %>%
+  filter(subject != "RCS16",
+         stage %in% c("N2", "N3", "REM")) %>%
+  select(subject, date, channel, stage, beta_amp) %>%
+  pivot_wider(names_from = stage, values_from = beta_amp) %>%
+  drop_na(N2, N3, REM)
+t.test(df_paired$N3, df_paired$REM, paired = TRUE)
+t.test(df_paired$N2, df_paired$REM, paired = TRUE)
 ```
 
 
@@ -1064,7 +1086,7 @@ for (var in outcome_variables){
   df_results_adjusted = bind_rows(df_results_adjusted, df_results_var)
 }
 df_results_adjusted %>% 
-  filter(p_adjust < 0.05) %>% 
+  # filter(p_adjust < 0.05) %>%
   print()
 
 # plot LME coefficient by hour
@@ -1205,7 +1227,7 @@ for (var in outcome_variables){
   df_results_adjusted = bind_rows(df_results_adjusted, df_results_var)
 }
 df_results_adjusted %>% 
-  filter(p_adjust < 0.05) %>%
+  # filter(p_adjust < 0.05) %>%
   print()
 
 
